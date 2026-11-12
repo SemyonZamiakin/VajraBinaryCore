@@ -1,0 +1,63 @@
+function(vajra_test name)
+  add_executable(${name} ${ARGN})
+  target_link_libraries(${name} PRIVATE vajra vajra_warnings)
+  target_include_directories(${name} PRIVATE ${PROJECT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME ${name} COMMAND ${name})
+  set_tests_properties(${name} PROPERTIES TIMEOUT 300)
+endfunction()
+
+vajra_test(test_decoder test_decoder.cpp)
+vajra_test(test_relocate test_relocate.cpp)
+vajra_test(test_migrate test_migrate.cpp)
+vajra_test(test_stop test_stop.cpp asm_targets.S)
+vajra_test(test_hook test_hook.cpp asm_targets.S)
+vajra_test(test_transaction test_transaction.cpp asm_targets.S)
+vajra_test(test_stress test_stress.cpp)
+
+# GOT/PLT redirection: a test library called through the PLT, linked once with
+# lazy binding and once with full RELRO (-z now), so both GOT layouts are covered.
+add_library(vajra_testlib SHARED testlib.cpp)
+target_compile_options(vajra_testlib PRIVATE -fno-plt -fno-semantic-interposition)
+vajra_test(test_got_lazy test_got.cpp)
+target_link_libraries(test_got_lazy PRIVATE vajra_testlib)
+target_compile_options(test_got_lazy PRIVATE -fplt)
+target_link_options(test_got_lazy PRIVATE -Wl,-z,lazy -Wl,-z,norelro)
+vajra_test(test_got_now test_got.cpp)
+target_link_libraries(test_got_now PRIVATE vajra_testlib)
+target_compile_options(test_got_now PRIVATE -fplt)
+target_link_options(test_got_now PRIVATE -Wl,-z,now -Wl,-z,relro)
+vajra_test(test_got_noplt test_got.cpp)
+target_link_libraries(test_got_noplt PRIVATE vajra_testlib)
+target_compile_options(test_got_noplt PRIVATE -fno-plt)
+target_compile_definitions(test_got_noplt PRIVATE VAJRA_TEST_NOPLT=1)
+
+# Agent: loads a patch module over the socket protocol.
+add_library(vajra_test_patch MODULE test_patch_module.cpp)
+target_link_libraries(vajra_test_patch PRIVATE vajra)
+vajra_test(test_agent test_agent.cpp)
+target_compile_definitions(test_agent PRIVATE VAJRA_TEST_PATCH="$<TARGET_FILE:vajra_test_patch>"
+                                              VAJRACTL="$<TARGET_FILE:vajractl>")
+set_target_properties(test_agent PROPERTIES ENABLE_EXPORTS ON)
+add_dependencies(test_agent vajra_test_patch vajractl)
+
+# Decoder cross-check against objdump (skipped when objdump is not installed).
+add_executable(vajra-decode-check decode_check.cpp)
+target_link_libraries(vajra-decode-check PRIVATE vajra vajra_warnings)
+find_program(VAJRA_OBJDUMP objdump)
+if(VAJRA_OBJDUMP)
+  execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libc.so.6
+                  OUTPUT_VARIABLE VAJRA_LIBC OUTPUT_STRIP_TRAILING_WHITESPACE)
+  execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libstdc++.so.6
+                  OUTPUT_VARIABLE VAJRA_LIBSTDCXX OUTPUT_STRIP_TRAILING_WHITESPACE)
+  set(_files $<TARGET_FILE:vajra> $<TARGET_FILE:test_hook>)
+  foreach(f ${VAJRA_LIBC} ${VAJRA_LIBSTDCXX})
+    if(EXISTS "${f}")
+      get_filename_component(real "${f}" REALPATH)
+      list(APPEND _files "${real}")
+    endif()
+  endforeach()
+  add_test(NAME decoder_vs_objdump COMMAND vajra-decode-check ${VAJRA_OBJDUMP} ${_files})
+  set_tests_properties(decoder_vs_objdump PROPERTIES TIMEOUT 600)
+else()
+  message(STATUS "objdump not found: decoder_vs_objdump test disabled")
+endif()
