@@ -56,6 +56,10 @@ void* spawn_v2(vajra::Heap* heap, std::uint32_t id, void* target) {
 
 int damage_v2(int level) { return level + 3; }  // the fixed formula
 
+// The host's damage_formula (patched to damage_v2 by this module), looked up
+// by name when the module is applied.
+int (*host_damage_formula)(int) = nullptr;
+
 void tick_v2(void* p, std::uint64_t tick) {
     auto* e = static_cast<EntityV2*>(p);
     e->x += e->vx * 0.01;
@@ -63,7 +67,7 @@ void tick_v2(void* p, std::uint64_t tick) {
     if (e->x < 0 || e->x > 100) e->vx = -e->vx;
     if (e->y < 0 || e->y > 100) e->vy = -e->vy;
     if (tick % 25 == e->id % 25) {
-        int dmg = damage_formula(e->level);  // goes through the (patched) host function
+        int dmg = host_damage_formula(e->level);  // goes through the (patched) host function
         const int absorbed = dmg < e->shield ? dmg : e->shield;
         e->shield -= absorbed;
         dmg -= absorbed;
@@ -107,11 +111,17 @@ VAJRA_PATCH_ENTRY {
     vajra::MigrationPlan inverse(entity_v2(), arena::entity_v1());
     inverse.rename("health", "hp").drop("shield").drop("pad").policy(vajra::ConvertPolicy::Saturate);
 
+    // Host functions are found by name: works for a .so and a .dll alike.
+    host_damage_formula = reinterpret_cast<int (*)(int)>(vajra::find_function("damage_formula"));
+    if (!host_damage_formula) {
+        ctx->message = "damage_formula not found in the host";
+        return 1;
+    }
     ctx->tx->migrate(*ctx->heap, forward, inverse)
-        .hook(&spawn_entity, &spawn_v2)
-        .hook(&tick_entity, &tick_v2)
-        .hook(&entity_summary, &summary_v2)
-        .hook(&damage_formula, &damage_v2);
+        .hook("spawn_entity", reinterpret_cast<void*>(&spawn_v2))
+        .hook("tick_entity", reinterpret_cast<void*>(&tick_v2))
+        .hook("entity_summary", reinterpret_cast<void*>(&summary_v2))
+        .hook("damage_formula", reinterpret_cast<void*>(&damage_v2));
     ctx->message = "Entity v1 -> v2, 4 functions replaced";
     return 0;
 }

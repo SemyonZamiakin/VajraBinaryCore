@@ -78,7 +78,8 @@ constexpr std::array<std::uint8_t, 256> make_one_byte() {
     t[0xCE] = kInv;
     t[0xCF] = kNone;
     for (int i = 0xD0; i <= 0xD3; ++i) t[i] = kM;
-    t[0xD4] = t[0xD5] = t[0xD6] = kInv;
+    t[0xD4] = t[0xD6] = kInv;
+    t[0xD5] = kSpecial;  // REX2 (Intel APX) - refused as unsupported
     t[0xD7] = kNone;
     for (int i = 0xD8; i <= 0xDF; ++i) t[i] = kM;  // x87
     for (int i = 0xE0; i <= 0xE3; ++i) t[i] = kSpecial;  // loop / jrcxz
@@ -384,6 +385,8 @@ bool decode(const std::uint8_t* code, std::size_t avail, Insn& out, DecodeError*
             return finish();
         }
         switch (op) {
+            case 0xD5:  // REX2 prefix of Intel APX; invalid on CPUs without APX
+                return fail(DecodeError::Unsupported);
             case 0x8F: {  // pop r/m64, or AMD XOP when ModRM.reg != 0
                 if (!c.has(1)) return fail(DecodeError::Truncated);
                 if ((c.peek() & 0x38) != 0) return fail(DecodeError::Unsupported);

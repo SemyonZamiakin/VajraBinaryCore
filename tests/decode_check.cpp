@@ -51,8 +51,13 @@ int main(int argc, char** argv) {
     long total = 0, mismatches = 0, skipped = 0;
     std::map<std::string, long> refused;  // decoder refused valid-looking instruction, by mnemonic
     for (int f = 2; f < argc; ++f) {
+#if defined(_WIN32)
+        const std::string cmd = "\"\"" + std::string(argv[1]) + "\" -d -w --insn-width=16 \"" + argv[f] + "\" 2>NUL\"";
+        FILE* p = ::_popen(cmd.c_str(), "r");
+#else
         const std::string cmd = std::string(argv[1]) + " -d -w --insn-width=16 '" + argv[f] + "' 2>/dev/null";
         FILE* p = ::popen(cmd.c_str(), "r");
+#endif
         if (!p) {
             std::fprintf(stderr, "cannot run %s\n", cmd.c_str());
             return 2;
@@ -66,8 +71,22 @@ int main(int argc, char** argv) {
             std::string mn;
             if (!parse_line(line, bytes, mn)) continue;
             static const char* kBarePrefixes[] = {"lock", "cs", "ds", "es", "fs", "gs", "ss", "data16", "addr32", "repnz", "repz", "rep", "udb", "bnd", "notrack"};
-            bool bare = false;  // a lone prefix byte objdump shows before data/padding
-            for (const char* bp : kBarePrefixes) bare = bare || mn == bp;
+            // Lines that are only prefixes: objdump shows them before data/padding.
+            bool bare = true;
+            {
+                std::size_t pos = 0;
+                while (pos < mn.size() && bare) {
+                    const std::size_t sp = mn.find(' ', pos);
+                    const std::string word = mn.substr(pos, sp == std::string::npos ? std::string::npos : sp - pos);
+                    if (!word.empty()) {
+                        bool is_prefix = false;
+                        for (const char* bp : kBarePrefixes) is_prefix = is_prefix || word == bp;
+                        bare = is_prefix;
+                    }
+                    if (sp == std::string::npos) break;
+                    pos = sp + 1;
+                }
+            }
             if (bare || mn.find("(bad)") != std::string::npos || mn.empty() || mn.rfind("rex", 0) == 0 ||
                 mn.find(".byte") != std::string::npos) {
                 ++skipped;
@@ -100,7 +119,11 @@ int main(int argc, char** argv) {
                 ++mismatches;
             }
         }
+#if defined(_WIN32)
+        ::_pclose(p);
+#else
         ::pclose(p);
+#endif
         std::printf("%-60s %9ld instructions\n", argv[f], file_total);
     }
     long refused_total = 0;

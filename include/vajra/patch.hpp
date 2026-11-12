@@ -99,8 +99,14 @@ private:
     std::shared_ptr<State> state_;
 };
 
-// The real-time signal used to stop threads (default SIGRTMIN+7). Must have no
-// other handler in the process.
+// Address of a function by name in the loaded modules (Linux: symbol tables,
+// including non-exported functions when the binary is not stripped; Windows:
+// export tables). module: substring of the module path, empty = any module.
+// Returns nullptr if not found. Patch modules use this to reach host functions.
+void* find_function(const std::string& name, const std::string& module = "");
+
+// Linux: the real-time signal used to stop threads (default SIGRTMIN+7). It
+// must have no other handler in the process. Windows: not used (Unsupported / 0).
 Result set_stop_signal(int sig);
 int stop_signal() noexcept;
 

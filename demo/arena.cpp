@@ -6,10 +6,16 @@
 // It checks its own invariants on every report and exits non-zero if any
 // failed.
 //
-//   arena --socket /tmp/arena.sock --seconds 30
+//   arena --socket /tmp/arena.sock --seconds 30          (Linux)
+//   arena --socket \\.\pipe\arena --seconds 30          (Windows)
 // SPDX-License-Identifier: MIT
 #include <signal.h>
+#if defined(_WIN32)
+#include <process.h>
+#define getpid _getpid
+#else
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -154,7 +160,11 @@ void spawner(vajra::Heap* heap) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+    std::string socket_path = "\\\\.\\pipe\\vajra-arena";
+#else
     std::string socket_path = "arena.sock";
+#endif
     int seconds = 0;  // 0: until SIGINT / SIGTERM
     for (int i = 1; i + 1 < argc; i += 2) {
         if (!std::strcmp(argv[i], "--socket")) socket_path = argv[i + 1];

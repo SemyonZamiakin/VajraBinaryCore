@@ -1,10 +1,17 @@
 // Transactions: all-or-nothing commit, rollback after a failed write (fault
 // injection), busy detection, code + data patched together, revert rules.
 // SPDX-License-Identifier: MIT
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <pthread.h>
 #include <signal.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <cstring>
@@ -130,6 +137,7 @@ TEST(each_fault_position) {
     CHECK_EQ(opaque(&tx_a)(5) + opaque(&tx_b)(5) + opaque(&tx_c)(5), 6 + 7 + 8);
 }
 
+#if !defined(_WIN32)
 namespace {
 std::atomic<bool> g_block_quit{false};
 void on_usr2(int) {}
@@ -167,6 +175,58 @@ TEST(busy_when_a_thread_sits_inside_the_patch) {
     CHECK_OK(p.revert());
     CHECK_EQ(opaque(&asm_block)(SYS_getpid), static_cast<long>(::getpid()));
 }
+#else
+namespace {
+std::atomic<bool> g_spin_quit{false};
+DWORD WINAPI spin_thread(void*) {
+    while (!g_spin_quit.load()) ::Sleep(1);
+    return 0;
+}
+[[noreturn]] void park_exit() { ::ExitThread(0); }
+}  // namespace
+
+TEST(busy_when_a_thread_sits_inside_the_patch) {
+    // A suspended thread whose instruction pointer we place at asm_window+2,
+    // inside the five bytes the hook overwrites.
+    HANDLE t = ::CreateThread(nullptr, 0, spin_thread, nullptr, 0, nullptr);
+    CHECK(t != nullptr);
+    if (!t) return;
+    ::Sleep(20);
+    CHECK(::SuspendThread(t) != static_cast<DWORD>(-1));
+    CONTEXT ctx;
+    ZeroMemory(&ctx, sizeof ctx);
+    ctx.ContextFlags = CONTEXT_CONTROL;
+    CHECK(::GetThreadContext(t, &ctx));
+    const CONTEXT saved = ctx;
+    ctx.Rip = reinterpret_cast<DWORD64>(&asm_window) + 2;
+    CHECK(::SetThreadContext(t, &ctx));
+
+    std::uint8_t before[5];
+    std::memcpy(before, reinterpret_cast<void*>(&asm_window), 5);
+    PatchOptions o;
+    o.busy_retries = 5;
+    o.busy_retry_delay_us = 2000;
+    auto fake = +[]() -> int { return 0; };
+    CHECK_STATUS(Transaction(o).hook(&asm_window, fake).commit(), Status::Busy);
+    CHECK(std::memcmp(before, reinterpret_cast<void*>(&asm_window), 5) == 0);
+
+    // Send the thread to ExitThread with a fresh, correctly aligned stack frame.
+    ctx = saved;
+    ctx.Rip = reinterpret_cast<DWORD64>(&park_exit);
+    ctx.Rsp = ((saved.Rsp - 512) & ~static_cast<DWORD64>(15)) - 8;
+    CHECK(::SetThreadContext(t, &ctx));
+    g_spin_quit = true;
+    ::ResumeThread(t);
+    CHECK(::WaitForSingleObject(t, 5000) == WAIT_OBJECT_0);
+    ::CloseHandle(t);
+
+    Patch p;
+    CHECK_OK(Transaction(o).hook(&asm_window, fake).commit(&p));
+    CHECK_EQ(opaque(&asm_window)(), 0);
+    CHECK_OK(p.revert());
+    CHECK_EQ(opaque(&asm_window)(), 7);
+}
+#endif
 
 TEST(code_and_data_together) {
     Heap heap;

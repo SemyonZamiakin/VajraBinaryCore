@@ -23,7 +23,7 @@ namespace {
 enum class State { Running, Parked, Region };
 
 struct Record {
-    pid_t tid = 0;
+    sys::tid_t tid = 0;
     State state = State::Running;
 };
 
@@ -33,7 +33,7 @@ struct Registry {
     std::vector<Record*> records;
     bool stopped = false;
     const Record* requester = nullptr;  // record of the stopping thread, if attached
-    pid_t requester_tid = 0;
+    sys::tid_t requester_tid = 0;
 };
 
 Registry& registry() {
@@ -43,7 +43,7 @@ Registry& registry() {
 
 thread_local Record* t_record = nullptr;
 
-bool is_requester(const Registry& r) { return r.stopped && r.requester_tid == sys::raw_gettid(); }
+bool is_requester(const Registry& r) { return r.stopped && r.requester_tid == sys::current_tid(); }
 
 // Parks the current (attached) thread while a stop is in progress. Called with the lock held.
 void park_locked(Registry& r, std::unique_lock<std::mutex>& lk, State while_parked) {
@@ -71,7 +71,7 @@ Result coop_stop(int timeout_ms) {
     std::unique_lock<std::mutex> lk(r.mu);
     r.stopped = true;
     r.requester = t_record;
-    r.requester_tid = sys::raw_gettid();
+    r.requester_tid = sys::current_tid();
     g_safepoint_requested.store(true, std::memory_order_release);
     auto all_safe = [&] {
         for (const Record* rec : r.records)
@@ -81,7 +81,7 @@ Result coop_stop(int timeout_ms) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     if (!r.cv.wait_until(lk, deadline, all_safe)) {
         std::size_t running = 0;
-        pid_t example = 0;
+        sys::tid_t example = 0;
         for (const Record* rec : r.records)
             if (rec != r.requester && rec->state == State::Running) {
                 ++running;
@@ -117,7 +117,7 @@ void Safepoints::attach() {
     std::unique_lock<std::mutex> lk(r.mu);
     if (detail::t_record) return;
     auto* rec = new detail::Record;
-    rec->tid = sys::raw_gettid();
+    rec->tid = sys::current_tid();
     r.records.push_back(rec);
     detail::t_record = rec;
     if (r.stopped && !detail::is_requester(r)) detail::park_locked(r, lk, detail::State::Parked);

@@ -84,8 +84,8 @@ TEST(write_fault_rolls_back) {
 
 TEST(redirect_while_threads_call) {
     std::atomic<bool> quit{false};
-    std::atomic<long> bad{0};
-    std::atomic<long> calls{0};
+    std::atomic<long long> bad{0};
+    std::atomic<long long> calls{0};
     std::vector<std::thread> ts;
     for (int t = 0; t < 4; ++t)
         ts.emplace_back([&, t] {

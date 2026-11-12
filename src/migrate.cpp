@@ -6,6 +6,9 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 #include <cstring>
 #include <limits>
 #include <set>
@@ -293,9 +296,21 @@ bool kinds_compatible(const FieldDesc& from, const FieldDesc& to, std::string& w
 void* aligned_zeroed(std::size_t size, std::size_t align) {
     if (align < alignof(std::max_align_t)) align = alignof(std::max_align_t);
     const std::size_t rounded = (size + align - 1) / align * align;
+#if defined(_WIN32)
+    void* p = ::_aligned_malloc(rounded, align);
+#else
     void* p = std::aligned_alloc(align, rounded);
+#endif
     if (p) std::memset(p, 0, rounded);
     return p;
+}
+
+void aligned_release(void* p) noexcept {
+#if defined(_WIN32)
+    ::_aligned_free(p);
+#else
+    std::free(p);
+#endif
 }
 
 }  // namespace
@@ -613,8 +628,8 @@ long MigrationPlan::map_offset(std::uint32_t old_offset) const noexcept {
 Heap::Heap() = default;
 
 Heap::~Heap() {
-    for (auto& [addr, info] : objects_) std::free(reinterpret_cast<void*>(addr));
-    for (void* p : quarantine_list_) std::free(p);
+    for (auto& [addr, info] : objects_) aligned_release(reinterpret_cast<void*>(addr));
+    for (void* p : quarantine_list_) aligned_release(p);
 }
 
 Result Heap::register_type(const TypeDesc& type) {
@@ -637,7 +652,7 @@ void* Heap::allocate(std::string_view type, std::uint32_t version) {
     try {
         objects_.emplace(reinterpret_cast<std::uintptr_t>(p), ObjInfo{ts});
     } catch (...) {
-        std::free(p);
+        aligned_release(p);
         return nullptr;
     }
     ++ts->count;
@@ -650,7 +665,7 @@ bool Heap::deallocate(void* p) {
     if (it == objects_.end()) return false;
     --it->second.type->count;
     objects_.erase(it);
-    std::free(p);
+    aligned_release(p);
     return true;
 }
 
@@ -723,7 +738,7 @@ void Heap::release_quarantine() {
         std::lock_guard<std::mutex> g(mu_);
         list.swap(quarantine_list_);
     }
-    for (void* p : list) std::free(p);
+    for (void* p : list) aligned_release(p);
 }
 
 // ------------------------------------------------------------ MigrationJob
@@ -887,7 +902,7 @@ void MigrationJob::commit() noexcept {
 }
 
 void MigrationJob::abort() noexcept {
-    for (std::uintptr_t p : news_) std::free(reinterpret_cast<void*>(p));
+    for (std::uintptr_t p : news_) aligned_release(reinterpret_cast<void*>(p));
     news_.clear();
     writes_.clear();
     prepared_ = false;
@@ -904,10 +919,10 @@ void MigrationJob::finalize() noexcept {
             try {
                 heap_.quarantine_list_.push_back(reinterpret_cast<void*>(p));
             } catch (...) {
-                std::free(reinterpret_cast<void*>(p));
+                aligned_release(reinterpret_cast<void*>(p));
             }
         } else {
-            std::free(reinterpret_cast<void*>(p));
+            aligned_release(reinterpret_cast<void*>(p));
         }
     }
     news_.clear();

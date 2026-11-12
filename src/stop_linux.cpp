@@ -1,4 +1,4 @@
-// Vajra Binary Core - signal-based stop-the-world.
+// Vajra Binary Core - stop-the-world, Linux implementation (real-time signal).
 // SPDX-License-Identifier: MIT
 #include "stop.hpp"
 
@@ -66,7 +66,7 @@ void stop_handler(int, siginfo_t* si, void* ucv) {
                                   std::memory_order_relaxed);
             g_slots[idx].sp.store(static_cast<std::uintptr_t>(uc->uc_mcontext.gregs[REG_RSP]),
                                   std::memory_order_relaxed);
-            g_slots[idx].tid.store(sys::raw_gettid(), std::memory_order_release);
+            g_slots[idx].tid.store(sys::current_tid(), std::memory_order_release);
         }
         g_arrived.fetch_add(1, std::memory_order_acq_rel);
         sys::raw_futex_wake(word(g_arrived), INT_MAX);
@@ -214,7 +214,7 @@ Result install_stop_handler() {
 
 Result world_stop(int timeout_ms) {
     const int sig = stop_signal_impl();
-    const pid_t self = sys::raw_gettid();
+    const pid_t self = sys::current_tid();
     const pid_t pid = sys::raw_getpid();
     std::uint32_t gen = g_gen.load() + 1;
     if (gen == 0) gen = 1;

@@ -46,10 +46,6 @@ constexpr std::uint32_t kSampleId = 7;
 
 }  // namespace arena
 
-// Hot-patch targets in the host executable.
-extern "C" {
-void* spawn_entity(vajra::Heap* heap, std::uint32_t id, void* target);
-void tick_entity(void* entity, std::uint64_t tick);
-int damage_formula(int level);
-void entity_summary(const void* entity, vajra::Heap* heap, arena::Summary* out);
-}
+// The host exports its hot-patch targets (spawn_entity, tick_entity,
+// damage_formula, entity_summary) by name; patch modules find them with
+// vajra::find_function() or Transaction::hook("name", ...).

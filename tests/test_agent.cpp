@@ -1,14 +1,22 @@
-// Agent: socket protocol through vajractl, module checks, apply and revert.
+// Agent: protocol through vajractl (Unix socket / named pipe), module checks,
+// apply and revert.
 // SPDX-License-Identifier: MIT
 #include <sys/stat.h>
-#include <unistd.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <string>
 
+#if !defined(_WIN32)
+#include <unistd.h>
+#else
+#include <direct.h>
+#include <process.h>
+#endif
+
 #include "check.hpp"
+#include "platform.hpp"
 #include "vajra/vajra.hpp"
 
 using namespace vajra;
@@ -32,31 +40,45 @@ F* opaque(F* f) {
     return p;
 }
 
-std::string run(const std::string& cmd, int* status = nullptr) {
-    std::string out;
-    FILE* p = ::popen(cmd.c_str(), "r");
-    if (!p) return out;
-    char buf[512];
-    while (std::fgets(buf, sizeof buf, p)) out += buf;
-    const int st = ::pclose(p);
-    if (status) *status = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
-    return out;
-}
-
 void copy_file(const std::string& from, const std::string& to) {
     std::ifstream in(from, std::ios::binary);
     std::ofstream out(to, std::ios::binary);
     out << in.rdbuf();
 }
 
+// A private scratch directory and the agent address.
+struct Scratch {
+    std::string dir;
+    std::string address;
+    Scratch() {
+#if defined(_WIN32)
+        char tmp[MAX_PATH];
+        ::GetTempPathA(sizeof tmp, tmp);
+        dir = std::string(tmp) + "vajra-agent-" + std::to_string(::_getpid());
+        ::_mkdir(dir.c_str());
+        address = "\\\\.\\pipe\\vajra-agent-test-" + std::to_string(::_getpid());
+#else
+        char tmpl[] = "/tmp/vajra-agent-XXXXXX";
+        if (char* d = ::mkdtemp(tmpl)) dir = d;
+        address = dir + "/agent.sock";
+#endif
+    }
+    ~Scratch() {
+#if defined(_WIN32)
+        ::_rmdir(dir.c_str());
+#else
+        ::rmdir(dir.c_str());
+#endif
+    }
+};
+
 }  // namespace
 
 TEST(agent_end_to_end) {
-    char dir_template[] = "/tmp/vajra-agent-XXXXXX";
-    char* dir = ::mkdtemp(dir_template);
-    CHECK(dir != nullptr);
-    if (!dir) return;
-    const std::string sock = std::string(dir) + "/agent.sock";
+    Scratch s;
+    CHECK(!s.dir.empty());
+    if (s.dir.empty()) return;
+    const std::string ctl = testplat::quote(VAJRACTL) + " " + testplat::quote(s.address);
 
     Heap heap;
     CHECK_OK(heap.register_type(kCounterV1));
@@ -66,20 +88,25 @@ TEST(agent_end_to_end) {
 
     Agent agent;
     Agent::Options o;
-    o.socket_path = sock;
+    o.socket_path = s.address;
     o.heap = &heap;
     CHECK_OK(agent.start(o));
-
+#if !defined(_WIN32)
     struct stat st;
-    CHECK(::stat(sock.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600);
+    CHECK(::stat(s.address.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600);
+#else
+    // A second agent cannot take over the same pipe name.
+    Agent squatter;
+    CHECK(!squatter.start(o).is_ok());
+#endif
 
     int status = -1;
-    std::string out = run(std::string(VAJRACTL) + " " + sock + " ping", &status);
+    std::string out = testplat::run(ctl + " ping", &status);
     CHECK_EQ(status, 0);
     CHECK(out.find("ok vajra") == 0);
 
     CHECK_EQ(opaque(&agent_target)(2), 3);
-    out = run(std::string(VAJRACTL) + " " + sock + " apply " + VAJRA_TEST_PATCH, &status);
+    out = testplat::run(ctl + " apply " + testplat::quote(VAJRA_TEST_PATCH), &status);
     CHECK_EQ(status, 0);
     CHECK(out.find("ok p1 counter-v2") == 0);
     CHECK_EQ(opaque(&agent_target)(2), 2000);
@@ -87,44 +114,53 @@ TEST(agent_end_to_end) {
     CHECK_EQ(static_cast<std::int64_t*>(counter)[0], 41);
     CHECK_EQ(static_cast<std::int64_t*>(counter)[1], 2);
 
-    out = run(std::string(VAJRACTL) + " " + sock + " list", &status);
+    out = testplat::run(ctl + " list", &status);
     CHECK(out.find("p1 active") != std::string::npos);
 
-    out = run(std::string(VAJRACTL) + " " + sock + " revert p1", &status);
+    out = testplat::run(ctl + " revert p1", &status);
     CHECK_EQ(status, 0);
     CHECK_EQ(opaque(&agent_target)(2), 3);
     CHECK_EQ(heap.version("Counter"), 1u);
     CHECK_EQ(static_cast<CounterV1*>(counter)->value, 41);
-    out = run(std::string(VAJRACTL) + " " + sock + " revert p1", &status);
+    out = testplat::run(ctl + " revert p1", &status);
     CHECK_EQ(status, 1);
     CHECK(out.find("not applied") != std::string::npos);
 
-    // Module checks: missing file, group-writable module, unknown command.
-    out = run(std::string(VAJRACTL) + " " + sock + " apply /nonexistent/x.so", &status);
+    // Module checks: missing file, unsafe permissions (Linux), not a module, unknown command.
+    out = testplat::run(ctl + " apply " + testplat::quote(s.dir + "/nonexistent.so"), &status);
     CHECK_EQ(status, 2);  // vajractl cannot resolve the path
-    const std::string writable = std::string(dir) + "/writable.so";
-    copy_file(VAJRA_TEST_PATCH, writable);
-    ::chmod(writable.c_str(), 0664);
+#if defined(_WIN32)
+    const std::string copy = s.dir + "\\copy.dll";
+#else
+    const std::string copy = s.dir + "/copy.so";
+#endif
+    copy_file(VAJRA_TEST_PATCH, copy);
     std::string id, msg;
-    CHECK_STATUS(agent.apply_module(writable, &id, &msg), Status::PermissionDenied);
-    ::chmod(writable.c_str(), 0644);
-    const std::string not_elf = std::string(dir) + "/not_elf.so";
-    { std::ofstream(not_elf) << "hello"; }
-    CHECK_STATUS(agent.apply_module(not_elf, &id, &msg), Status::InvalidArgument);
+#if !defined(_WIN32)
+    ::chmod(copy.c_str(), 0664);
+    CHECK_STATUS(agent.apply_module(copy, &id, &msg), Status::PermissionDenied);
+    ::chmod(copy.c_str(), 0644);
+#endif
+    const std::string not_module = s.dir + "/not_a_module.bin";
+    { std::ofstream(not_module) << "hello"; }
+    CHECK_STATUS(agent.apply_module(not_module, &id, &msg), Status::InvalidArgument);
     CHECK(agent.handle_command("bogus").find("error unknown command") == 0);
 
-    // The same module applied again through the API (a second copy of the file).
-    CHECK_OK(agent.apply_module(writable, &id, &msg));
+    // A second copy of the module applied through the API.
+    CHECK_OK(agent.apply_module(copy, &id, &msg));
     CHECK(id == "p2");
     CHECK_EQ(opaque(&agent_target)(3), 3000);
     CHECK_OK(agent.revert("p2"));
     CHECK_EQ(opaque(&agent_target)(3), 4);
 
     agent.stop();
-    CHECK(::access(sock.c_str(), F_OK) != 0);  // socket removed
-    ::unlink(writable.c_str());
-    ::unlink(not_elf.c_str());
-    ::rmdir(dir);
+#if !defined(_WIN32)
+    CHECK(::access(s.address.c_str(), F_OK) != 0);  // socket removed
+#endif
+    std::remove(not_module.c_str());
+#if !defined(_WIN32)
+    std::remove(copy.c_str());  // on Windows the DLL stays loaded (modules are never unloaded)
+#endif
 }
 
 TEST_MAIN()

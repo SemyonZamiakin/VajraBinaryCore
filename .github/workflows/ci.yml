@@ -1,0 +1,110 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  linux:
+    name: linux / ${{ matrix.cc }} / ${{ matrix.build }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {cc: gcc, cxx: g++, build: RelWithDebInfo}
+          - {cc: gcc, cxx: g++, build: Debug}
+          - {cc: clang, cxx: clang++, build: Release}
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DVAJRA_WERROR=ON
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    name: linux / clang / ${{ matrix.san }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        san: ["address,undefined", "thread"]
+    env:
+      CC: clang
+      CXX: clang++
+      ASAN_OPTIONS: detect_leaks=1
+      UBSAN_OPTIONS: print_stacktrace=1
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+      # Recent kernels randomize mmap more than older TSan/ASan runtimes expect.
+      - name: Relax ASLR entropy for sanitizers
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DVAJRA_WERROR=ON -DVAJRA_SANITIZE=${{ matrix.san }}
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows:
+    name: windows / mingw-w64 gcc (${{ matrix.sys }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sys: [MINGW64, UCRT64]
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.sys }}
+          pacboy: gcc:p cmake:p ninja:p binutils:p
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVAJRA_WERROR=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  install:
+    name: install and consume as a CMake package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and install
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVAJRA_BUILD_TESTS=OFF -DVAJRA_BUILD_DEMO=OFF
+          cmake --build build -j"$(nproc)"
+          cmake --install build --prefix "$RUNNER_TEMP/prefix"
+      - name: Consumer
+        run: |
+          mkdir -p "$RUNNER_TEMP/consumer"
+          cat > "$RUNNER_TEMP/consumer/CMakeLists.txt" <<'CMAKE'
+          cmake_minimum_required(VERSION 3.16)
+          project(consumer CXX)
+          find_package(Vajra REQUIRED)
+          add_executable(consumer main.cpp)
+          target_compile_features(consumer PRIVATE cxx_std_17)
+          target_link_libraries(consumer PRIVATE Vajra::vajra)
+          CMAKE
+          cat > "$RUNNER_TEMP/consumer/main.cpp" <<'CPP'
+          #include <vajra/vajra.hpp>
+          extern "C" VAJRA_PATCHABLE int answer() { int r = 41; __asm__ volatile("" : "+r"(r)); return r + 1; }
+          static int patched() { return 7; }
+          int main() {
+              vajra::Patch p;
+              if (!vajra::Transaction().hook(&answer, &patched).commit(&p)) return 1;
+              int (*volatile f)() = &answer;
+              const bool ok = f() == 7 && p.revert() && f() == 42;
+              return ok ? 0 : 1;
+          }
+          CPP
+          cmake -S "$RUNNER_TEMP/consumer" -B "$RUNNER_TEMP/consumer/build" -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/prefix"
+          cmake --build "$RUNNER_TEMP/consumer/build"
+          LD_LIBRARY_PATH="$RUNNER_TEMP/prefix/lib" "$RUNNER_TEMP/consumer/build/consumer"

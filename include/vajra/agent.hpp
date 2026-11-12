@@ -1,17 +1,19 @@
 // Vajra Binary Core - in-process patch agent.
 //
 // The agent lets an operator apply patch modules to a running program that
-// links Vajra. It listens on a Unix domain socket (mode 0600, peer uid checked
-// with SO_PEERCRED) and accepts one-line commands, normally sent by the
-// `vajractl` tool:
+// links Vajra. It listens on
+//   Linux:   a Unix domain socket (mode 0600, peer uid checked with SO_PEERCRED);
+//   Windows: a named pipe such as \\.\pipe\myapp-vajra (local clients only,
+//            DACL granting access to the current user only)
+// and accepts one-line commands, normally sent by the `vajractl` tool:
 //
 //   ping                 -> ok vajra <version>
-//   apply <module.so>    -> loads the module, runs its entry point to build a
-//                           Transaction, commits it; replies "ok <id>"
+//   apply <module>       -> loads the module (.so / .dll), runs its entry point
+//                           to build a Transaction, commits it; replies "ok <id>"
 //   revert <id>          -> reverts that patch
 //   list                 -> one line per patch: <id> <active|reverted> <module>
 //
-// A patch module is a shared object exporting
+// A patch module is a shared library exporting
 //
 //   VAJRA_PATCH_ENTRY {            // extern "C" int vajra_patch_entry(vajra::PatchContext*)
 //       ctx->tx->hook(...).migrate(*ctx->heap, ...);
@@ -41,17 +43,25 @@ struct PatchContext {
 
 using PatchEntryFn = int (*)(PatchContext*);
 
+#if defined(_WIN32)
+#define VAJRA_PATCH_ENTRY extern "C" __declspec(dllexport) int vajra_patch_entry(::vajra::PatchContext* ctx)
+#else
 #define VAJRA_PATCH_ENTRY \
     extern "C" __attribute__((visibility("default"))) int vajra_patch_entry(::vajra::PatchContext* ctx)
+#endif
 
 class Agent {
 public:
     struct Options {
-        std::string socket_path;  // required; the parent directory should be private
+        // Linux: path of the socket (put it in a private directory).
+        // Windows: pipe name, \\.\pipe\<name>.
+        std::string socket_path;
         Heap* heap = nullptr;
         void* user = nullptr;
         PatchOptions patch;
-        // Refuse modules not owned by this user (or root) or writable by group/others.
+        // Refuse modules not owned by this user (or root; on Windows also
+        // Administrators, SYSTEM, TrustedInstaller). Linux additionally refuses
+        // files writable by group or others.
         bool check_module_owner = true;
     };
 

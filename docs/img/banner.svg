@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="Vajra Binary Core by Euclase">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0F2933"/>
+      <stop offset="1" stop-color="#0A1F27"/>
+    </linearGradient>
+    <linearGradient id="gem" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#99F6E4"/>
+      <stop offset="1" stop-color="#2DD4BF"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="320" fill="url(#bg)"/>
+  <!-- a column of machine code; one row is being rewritten (the detour) -->
+  <g transform="translate(70 62)" font-family="Consolas, 'JetBrains Mono', monospace" font-size="17">
+    <rect x="-14" y="-24" width="252" height="222" rx="10" fill="#0B222B" stroke="#1B4556" stroke-width="2"/>
+    <text x="0" y="0" fill="#4E7A86">f3 0f 1e fa</text>
+    <rect x="-6" y="14" width="236" height="26" rx="4" fill="url(#gem)"/>
+    <text x="0" y="33" fill="#0F2933" font-weight="700">e9 3c 81 7f 00</text>
+    <text x="0" y="66" fill="#4E7A86">48 83 ec 28</text>
+    <text x="0" y="96" fill="#4E7A86">8b 05 6a 1f 00 00</text>
+    <text x="0" y="126" fill="#4E7A86">85 c0</text>
+    <text x="0" y="156" fill="#4E7A86">74 12</text>
+    <text x="0" y="186" fill="#4E7A86">c3</text>
+    <!-- arrow from the jmp to the trampoline -->
+    <path d="M 238 27 C 270 27, 270 100, 300 100" fill="none" stroke="#2DD4BF" stroke-width="3"/>
+    <polygon points="300,92 314,100 300,108" fill="#2DD4BF"/>
+  </g>
+  <!-- vajra / lightning in a gem -->
+  <g transform="translate(415 160)">
+    <polygon points="0,-62 54,-31 54,31 0,62 -54,31 -54,-31" fill="url(#gem)"/>
+    <polygon points="0,-62 54,-31 0,0 -54,-31" fill="#F8FAFC" fill-opacity=".30"/>
+    <polygon points="8,-44 -20,6 -2,6 -10,44 22,-8 4,-8" fill="#0F2933"/>
+  </g>
+  <g font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif">
+    <text x="510" y="148" fill="#F8FAFC" font-size="66" font-weight="700" letter-spacing="-1">Vajra <tspan fill="#2DD4BF">Binary Core</tspan></text>
+    <text x="514" y="196" fill="#8FB3BC" font-size="21">Live patching and type migration for native x86-64 code · Linux &amp; Windows</text>
+    <text x="514" y="244" fill="#2DD4BF" font-size="18" font-weight="600" letter-spacing="5">BY EUCLASE</text>
+  </g>
+</svg>

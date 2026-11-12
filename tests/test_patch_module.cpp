@@ -1,11 +1,10 @@
 // Patch module used by test_agent: replaces agent_target() in the host and
-// migrates the host's "Counter" objects from v1 to v2 (revertible).
+// migrates the host's "Counter" objects from v1 to v2 (revertible). Host
+// functions are found by name, which works for .so and .dll modules alike.
 // SPDX-License-Identifier: MIT
 #include <cstdint>
 
 #include "vajra/vajra.hpp"
-
-extern "C" int agent_target(int x);  // resolved from the host executable
 
 namespace {
 struct CounterV1 {
@@ -23,6 +22,11 @@ VAJRA_PATCH_ENTRY {
         ctx->message = "no heap";
         return 1;
     }
+    void* target = vajra::find_function("agent_target");
+    if (!target) {
+        ctx->message = "agent_target not found in the host";
+        return 2;
+    }
     const auto v1 = vajra::describe<CounterV1>("Counter", 1, {VAJRA_FIELD(CounterV1, value)});
     const auto v2 = vajra::describe<CounterV2>("Counter", 2,
                                                {VAJRA_FIELD(CounterV2, value), VAJRA_FIELD(CounterV2, generation)});
@@ -30,7 +34,7 @@ VAJRA_PATCH_ENTRY {
     fwd.fill_int("generation", 2);
     vajra::MigrationPlan inv(v2, v1);
     inv.drop("generation");
-    ctx->tx->hook(&agent_target, &patched_target).migrate(*ctx->heap, fwd, inv);
+    ctx->tx->hook(target, reinterpret_cast<void*>(&patched_target)).migrate(*ctx->heap, fwd, inv);
     ctx->message = "counter-v2";
     return 0;
 }

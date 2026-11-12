@@ -48,14 +48,14 @@ int env_int(const char* name, int def) {
 TEST(hook_storm) {
     const int cycles = env_int("VAJRA_STRESS_CYCLES", 500);
     std::atomic<bool> quit{false};
-    std::atomic<long> bad{0}, calls{0};
+    std::atomic<long long> bad{0}, calls{0};
     std::vector<std::thread> ts;
     for (int t = 0; t < 8; ++t)
         ts.emplace_back([&, t] {
             auto* f = opaque(&stress_target);
             auto* g = opaque(&stress_other);
             int x = t;
-            long local = 0;
+            long long local = 0;
             while (!quit.load(std::memory_order_relaxed)) {
                 const int r = f(x);
                 if (r != 3 * x && r != 3 * x + 1) bad.fetch_add(1);
@@ -87,7 +87,7 @@ TEST(hook_storm) {
     CHECK(calls.load() > 0);
     CHECK_EQ(opaque(&stress_target)(5), 15);
     CHECK_EQ(opaque(&stress_other)(5), 16);
-    std::fprintf(stderr, "    %d hook/revert cycles, %ld calls from 8 threads\n", cycles + cycles / 2, calls.load());
+    std::fprintf(stderr, "    %d hook/revert cycles, %lld calls from 8 threads\n", cycles + cycles / 2, calls.load());
 }
 
 // ---------------------------------------------------------------- migration storm
@@ -146,14 +146,14 @@ TEST(migration_storm) {
     heap.add_root_range(g_accounts, kAccounts);
 
     std::atomic<bool> quit{false};
-    std::atomic<long> transfers{0};
+    std::atomic<long long> transfers{0};
     std::vector<std::thread> ts;
     for (int t = 0; t < kMutators; ++t)
         ts.emplace_back([&, t] {
             ScopedAttach attach;
             unsigned rng = 12345u + static_cast<unsigned>(t);
             const int base = t * (kAccounts / kMutators);
-            long local = 0;
+            long long local = 0;
             auto* fn = opaque(&transfer);
             while (!quit.load(std::memory_order_relaxed)) {
                 Safepoints::poll();  // no raw account pointers are held across this point
@@ -191,8 +191,85 @@ TEST(migration_storm) {
     }
     CHECK_EQ(total, static_cast<std::int64_t>(kAccounts) * 1000);
     CHECK(transfers.load() > 0);
-    std::fprintf(stderr, "    %d migrate+hook/revert cycles, %ld transfers from %d mutators\n", cycles,
+    std::fprintf(stderr, "    %d migrate+hook/revert cycles, %lld transfers from %d mutators\n", cycles,
                  transfers.load(), kMutators);
+}
+
+// ---------------------------------------------------------------- append-only migration storm
+// Migration without any code patch: v2 only appends a field, so the mutators'
+// code (which touches the int64 at offset 0) is valid for both layouts. No
+// world stop is needed, which also makes this test usable under TSan.
+
+namespace {
+struct LedgerV1 {
+    std::int64_t balance;
+    std::uint32_t id;
+    std::uint32_t pad;
+};
+struct LedgerV2 {
+    std::int64_t balance;
+    std::uint32_t id;
+    std::uint32_t pad;
+    std::int64_t audit;
+};
+const TypeDesc kLedgerV1 = describe<LedgerV1>("Ledger", 1, {VAJRA_FIELD(LedgerV1, balance), VAJRA_FIELD(LedgerV1, id),
+                                                            VAJRA_FIELD(LedgerV1, pad)});
+const TypeDesc kLedgerV2 = describe<LedgerV2>("Ledger", 2, {VAJRA_FIELD(LedgerV2, balance), VAJRA_FIELD(LedgerV2, id),
+                                                            VAJRA_FIELD(LedgerV2, pad), VAJRA_FIELD(LedgerV2, audit)});
+void* g_ledgers[kAccounts];
+}  // namespace
+
+TEST(append_migration_storm) {
+    const int cycles = env_int("VAJRA_STRESS_MIGRATIONS", 60);
+    Heap heap;
+    CHECK_OK(heap.register_type(kLedgerV1));
+    for (int i = 0; i < kAccounts; ++i) {
+        auto* a = static_cast<LedgerV1*>(heap.allocate("Ledger", 1));
+        a->balance = 500;
+        a->id = static_cast<std::uint32_t>(i);
+        g_ledgers[i] = a;
+    }
+    heap.add_root_range(g_ledgers, kAccounts);
+    std::atomic<bool> quit{false};
+    std::atomic<long long> moves{0};
+    std::vector<std::thread> ts;
+    for (int t = 0; t < kMutators; ++t)
+        ts.emplace_back([&, t] {
+            ScopedAttach attach;
+            unsigned rng = 777u + static_cast<unsigned>(t);
+            const int base = t * (kAccounts / kMutators);
+            long long local = 0;
+            while (!quit.load(std::memory_order_relaxed)) {
+                Safepoints::poll();
+                rng = rng * 1103515245u + 12345u;
+                const int i = base + static_cast<int>((rng >> 8) % (kAccounts / kMutators));
+                const int j = base + static_cast<int>((rng >> 16) % (kAccounts / kMutators));
+                if (i == j) continue;
+                *static_cast<std::int64_t*>(g_ledgers[i]) -= 3;  // offset 0 in both layouts
+                *static_cast<std::int64_t*>(g_ledgers[j]) += 3;
+                ++local;
+            }
+            moves.fetch_add(local);
+        });
+    MigrationPlan fwd(kLedgerV1, kLedgerV2);
+    fwd.fill_int("audit", 1);
+    MigrationPlan inv(kLedgerV2, kLedgerV1);
+    inv.drop("audit");
+    for (int c = 0; c < cycles; ++c) {
+        Patch p;
+        CHECK_OK(Transaction().migrate(heap, fwd, inv).commit(&p));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK_OK(p.revert());
+    }
+    quit = true;
+    for (auto& t : ts) t.join();
+    std::int64_t total = 0;
+    for (int i = 0; i < kAccounts; ++i) {
+        CHECK(heap.owns(g_ledgers[i]));
+        total += static_cast<LedgerV1*>(g_ledgers[i])->balance;
+    }
+    CHECK_EQ(total, static_cast<std::int64_t>(kAccounts) * 500);
+    CHECK(moves.load() > 0);
 }
 
 TEST_MAIN()

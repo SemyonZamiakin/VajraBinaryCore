@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -20,9 +22,13 @@ inline std::vector<Case>& cases() {
     static std::vector<Case> c;
     return c;
 }
-inline int& failures() {
-    static int f = 0;
+inline std::atomic<int>& failures() {  // CHECKs may run on several threads
+    static std::atomic<int> f{0};
     return f;
+}
+inline std::mutex& report_mutex() {
+    static std::mutex m;
+    return m;
 }
 inline const char*& current() {
     static const char* c = "";
@@ -34,6 +40,7 @@ struct Registrar {
 };
 
 inline void report(const char* file, int line, const std::string& what) {
+    std::lock_guard<std::mutex> g(report_mutex());
     ++failures();
     std::fprintf(stderr, "  FAIL %s (%s:%d): %s\n", current(), file, line, what.c_str());
 }
@@ -49,7 +56,7 @@ inline int run_all(int argc, char** argv) {
         ++ran;
         std::fprintf(stderr, "%s %s\n", failures() == before ? "  ok  " : "  FAIL", c.name);
     }
-    std::fprintf(stderr, "%d test(s), %d failure(s)\n", ran, failures());
+    std::fprintf(stderr, "%d test(s), %d failure(s)\n", ran, failures().load());
     return failures() == 0 && ran > 0 ? 0 : 1;
 }
 

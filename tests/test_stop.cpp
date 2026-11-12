@@ -1,11 +1,12 @@
 // Stopping threads: signal-based stop-the-world (PC capture, threads created
 // during the stop, blocked signals) and cooperative safe points.
 // SPDX-License-Identifier: MIT
+#if !defined(_WIN32)
 #include <dirent.h>
 #include <pthread.h>
 #include <signal.h>
-#include <sys/syscall.h>
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -15,6 +16,7 @@
 
 #include "asm_targets.hpp"
 #include "check.hpp"
+#include "platform.hpp"
 #include "stop.hpp"
 #include "vajra/safepoint.hpp"
 
@@ -22,6 +24,7 @@ using namespace vajra;
 
 namespace {
 
+#if !defined(_WIN32)
 int count_tasks() {
     int n = 0;
     DIR* d = ::opendir("/proc/self/task");
@@ -30,6 +33,8 @@ int count_tasks() {
     ::closedir(d);
     return n;
 }
+void on_usr2(int) {}
+#endif
 
 struct Spinners {
     std::atomic<bool> quit{false};
@@ -52,8 +57,6 @@ struct Spinners {
     }
 };
 
-void on_usr2(int) {}
-
 }  // namespace
 
 TEST(signal_stop_freezes_everyone) {
@@ -66,11 +69,7 @@ TEST(signal_stop_freezes_everyone) {
         std::uintptr_t pcs[64] = {};  // read while stopped; the list is cleared on resume
         for (std::size_t i = 0; i < stopped && i < 64; ++i) pcs[i] = detail::world_stopped_thread(i).pc;
         const std::uint64_t frozen = s.sum();
-        // Sleep with a raw syscall: no libc locks while others are stopped.
-        {
-            struct timespec ts{0, 5 * 1000 * 1000};
-            ::syscall(SYS_nanosleep, &ts, nullptr);
-        }
+        testplat::raw_sleep_ms(5);  // no user-mode locks while others are stopped
         const std::uint64_t later = s.sum();
         detail::world_resume();
         CHECK(stopped >= 4);
@@ -81,6 +80,7 @@ TEST(signal_stop_freezes_everyone) {
     }
 }
 
+#if !defined(_WIN32)
 TEST(pc_of_blocked_thread) {
     CHECK_OK(detail::install_stop_handler());
     struct sigaction sa;
@@ -88,9 +88,9 @@ TEST(pc_of_blocked_thread) {
     sa.sa_handler = on_usr2;
     sigaction(SIGUSR2, &sa, nullptr);
     std::atomic<bool> quit{false};
-    std::atomic<pid_t> tid{0};
+    std::atomic<long> tid{0};
     std::thread t([&] {
-        tid = static_cast<pid_t>(::syscall(SYS_gettid));
+        tid = testplat::current_tid();
         while (!quit) asm_block(SYS_pause);
     });
     while (tid == 0) std::this_thread::yield();
@@ -105,6 +105,40 @@ TEST(pc_of_blocked_thread) {
     pthread_kill(t.native_handle(), SIGUSR2);
     t.join();
 }
+#else
+TEST(pc_of_suspended_thread) {
+    // Windows: a thread parked (suspended) at a known address is reported there.
+    CHECK_OK(detail::install_stop_handler());
+    std::atomic<bool> quit{false};
+    std::atomic<long> tid{0};
+    std::thread t([&] {
+        tid = testplat::current_tid();
+        while (!quit) ::Sleep(1);
+    });
+    while (tid == 0) std::this_thread::yield();
+    HANDLE h = ::OpenThread(THREAD_ALL_ACCESS, FALSE, static_cast<DWORD>(tid.load()));
+    CHECK(h != nullptr);
+    ::SuspendThread(h);
+    CONTEXT ctx;
+    ZeroMemory(&ctx, sizeof ctx);
+    ctx.ContextFlags = CONTEXT_CONTROL;
+    ::GetThreadContext(h, &ctx);
+    const CONTEXT saved = ctx;
+    ctx.Rip = reinterpret_cast<DWORD64>(&asm_window) + 3;
+    ::SetThreadContext(h, &ctx);
+    CHECK_OK(detail::world_stop(2000));
+    std::uintptr_t pc = 0;
+    for (std::size_t i = 0; i < detail::world_stopped_count(); ++i)
+        if (detail::world_stopped_thread(i).tid == tid) pc = detail::world_stopped_thread(i).pc;
+    detail::world_resume();
+    CHECK_EQ(pc, reinterpret_cast<std::uintptr_t>(&asm_window) + 3);
+    ::SetThreadContext(h, &saved);  // back to where it was
+    quit = true;
+    ::ResumeThread(h);
+    ::CloseHandle(h);
+    t.join();
+}
+#endif
 
 TEST(threads_created_during_stop_are_caught) {
     CHECK_OK(detail::install_stop_handler());
@@ -120,8 +154,7 @@ TEST(threads_created_during_stop_are_caught) {
     for (int round = 0; round < 50; ++round) {
         CHECK_OK(detail::world_stop(2000));
         const std::uint64_t a = spawned.load();
-        struct timespec ts{0, 2 * 1000 * 1000};
-        ::syscall(SYS_nanosleep, &ts, nullptr);
+        testplat::raw_sleep_ms(2);
         const std::uint64_t b = spawned.load();
         detail::world_resume();
         CHECK_EQ(a, b);  // no thread ran while stopped, including brand-new ones
@@ -131,6 +164,7 @@ TEST(threads_created_during_stop_are_caught) {
     CHECK(spawned.load() > 0);
 }
 
+#if !defined(_WIN32)
 TEST(blocked_signal_times_out_and_resumes) {
     CHECK_OK(detail::install_stop_handler());
     Spinners s(2);
@@ -163,6 +197,7 @@ TEST(stop_with_no_other_threads) {
     CHECK_EQ(detail::world_stopped_count(), static_cast<std::size_t>(before - 1));
     detail::world_resume();
 }
+#endif
 
 TEST(coop_stop_parks_attached_threads) {
     std::atomic<bool> quit{false};

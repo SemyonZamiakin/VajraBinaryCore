@@ -9,7 +9,8 @@
 #   clang  Clang, Release, -Werror
 #   debug  GCC, Debug (-O0: different prologues than optimized code)
 #   asan   Clang, AddressSanitizer + UndefinedBehaviorSanitizer
-#   tsan   Clang, ThreadSanitizer
+#   tsan   Clang, ThreadSanitizer (only tests that do not stop threads by signal;
+#          TSan defers asynchronous signals, see docs/DESIGN.md)
 set -euo pipefail
 
 configs=("$@")

@@ -1,7 +1,8 @@
-// Vajra Binary Core - internal Linux/x86-64 system layer.
+// Vajra Binary Core - system layer, Linux implementation.
 // SPDX-License-Identifier: MIT
 #include "sys.hpp"
 
+#include <dlfcn.h>
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -21,28 +22,20 @@
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
 
+static_assert(PROT_READ == 1 && PROT_WRITE == 2 && PROT_EXEC == 4, "kProt* mirror PROT_*");
+
 namespace vajra::sys {
 
 namespace {
-std::atomic<int> g_write_fault{0};
 const std::size_t g_page_size = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
 
-// Returns true if this write must fail (fault injection for tests).
-bool injected_fault() noexcept {
-    int v = g_write_fault.load(std::memory_order_relaxed);
-    while (v > 0) {
-        if (g_write_fault.compare_exchange_weak(v, v - 1, std::memory_order_relaxed)) return v == 1;
-    }
-    return false;
-}
-
 // Byte copy that the compiler cannot turn into a libc memcpy call.
-void volatile_copy(std::uintptr_t dst, const std::uint8_t* src, std::size_t n) noexcept {
+VAJRA_NO_TSAN void volatile_copy(std::uintptr_t dst, const std::uint8_t* src, std::size_t n) noexcept {
     volatile std::uint8_t* d = reinterpret_cast<volatile std::uint8_t*>(dst);
     for (std::size_t i = 0; i < n; ++i) d[i] = src[i];
 }
 
-bool volatile_equal(std::uintptr_t a, const std::uint8_t* b, std::size_t n) noexcept {
+VAJRA_NO_TSAN bool volatile_equal(std::uintptr_t a, const std::uint8_t* b, std::size_t n) noexcept {
     const volatile std::uint8_t* p = reinterpret_cast<const volatile std::uint8_t*>(a);
     for (std::size_t i = 0; i < n; ++i)
         if (p[i] != b[i]) return false;
@@ -65,8 +58,8 @@ long raw_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) n
     return ret;
 }
 
-pid_t raw_gettid() noexcept { return static_cast<pid_t>(raw_syscall(SYS_gettid)); }
-pid_t raw_getpid() noexcept { return static_cast<pid_t>(raw_syscall(SYS_getpid)); }
+tid_t current_tid() noexcept { return raw_syscall(SYS_gettid); }
+long raw_getpid() noexcept { return raw_syscall(SYS_getpid); }
 
 long raw_futex_wait(const volatile std::uint32_t* addr, std::uint32_t expected, long timeout_ns) noexcept {
     struct timespec ts;
@@ -103,9 +96,7 @@ void cpu_serialize() noexcept {
     (void)d;
 }
 
-void cpu_relax() noexcept { __asm__ volatile("pause" ::: "memory"); }
-
-void raw_sleep_us(long us) noexcept {
+void sleep_us(long us) noexcept {
     struct timespec ts;
     ts.tv_sec = us / 1000000L;
     ts.tv_nsec = (us % 1000000L) * 1000L;
@@ -113,8 +104,6 @@ void raw_sleep_us(long us) noexcept {
 }
 
 std::size_t page_size() noexcept { return g_page_size; }
-
-void set_write_fault_countdown(int n) noexcept { g_write_fault.store(n, std::memory_order_relaxed); }
 
 // ---------------------------------------------------------------- maps
 
@@ -158,10 +147,9 @@ Result read_maps(std::vector<MapEntry>& out) {
         e.end = std::strtoull(end + 1, &end, 16);
         if (*end != ' ' || std::strlen(end) < 5) continue;
         const char* perms = end + 1;
-        if (perms[0] == 'r') e.prot |= PROT_READ;
-        if (perms[1] == 'w') e.prot |= PROT_WRITE;
-        if (perms[2] == 'x') e.prot |= PROT_EXEC;
-        e.is_private = perms[3] == 'p';
+        if (perms[0] == 'r') e.prot |= kProtRead;
+        if (perms[1] == 'w') e.prot |= kProtWrite;
+        if (perms[2] == 'x') e.prot |= kProtExec;
         // path: the 6th field, which may contain spaces
         int field = 0;
         const char* p = perms;
@@ -174,23 +162,6 @@ Result read_maps(std::vector<MapEntry>& out) {
         out.push_back(std::move(e));
     }
     std::sort(out.begin(), out.end(), [](const MapEntry& a, const MapEntry& b) { return a.start < b.start; });
-    return Result::ok();
-}
-
-Result range_protection(const std::vector<MapEntry>& maps, std::uintptr_t addr, std::size_t len, int* prot) {
-    std::uintptr_t cur = page_floor(addr);
-    const std::uintptr_t hi = page_ceil(addr + len);
-    int found = -1;
-    for (const auto& m : maps) {
-        if (m.end <= cur) continue;
-        if (m.start > cur) break;  // hole
-        if (found >= 0 && m.prot != found) return {Status::Unsupported, "range spans mappings with different protections"};
-        found = m.prot;
-        cur = m.end;
-        if (cur >= hi) break;
-    }
-    if (found < 0 || cur < hi) return {Status::NotFound, "address range is not fully mapped"};
-    *prot = found;
     return Result::ok();
 }
 
@@ -246,7 +217,7 @@ bool MemoryWriter::overlaps_forbidden(std::uintptr_t lo, std::uintptr_t hi) cons
     return false;
 }
 
-int MemoryWriter::write_procmem(std::uintptr_t addr, const std::uint8_t* data, std::size_t len) noexcept {
+int MemoryWriter::write_direct(std::uintptr_t addr, const std::uint8_t* data, std::size_t len) noexcept {
     if (mem_fd_ < 0) return -EBADF;
     std::size_t done = 0;
     while (done < len) {
@@ -259,12 +230,12 @@ int MemoryWriter::write_procmem(std::uintptr_t addr, const std::uint8_t* data, s
     return 0;
 }
 
-int MemoryWriter::write_mprotect(std::uintptr_t addr, const std::uint8_t* data, std::size_t len, int prot,
+int MemoryWriter::write_reprotect(std::uintptr_t addr, const std::uint8_t* data, std::size_t len, int prot,
                                  bool rwx) noexcept {
     const std::uintptr_t lo = page_floor(addr);
     const std::uintptr_t hi = page_ceil(addr + len);
-    if (!rwx && (prot & PROT_EXEC) && overlaps_forbidden(lo, hi)) return -EPERM;
-    const int tmp = rwx ? (PROT_READ | PROT_WRITE | PROT_EXEC) : ((prot & PROT_READ) | PROT_WRITE);
+    if (!rwx && (prot & kProtExec) && overlaps_forbidden(lo, hi)) return -EPERM;
+    const int tmp = rwx ? (kProtRead | kProtWrite | kProtExec) : ((prot & kProtRead) | kProtWrite);
     long r = raw_mprotect(lo, hi - lo, tmp);
     if (r != 0) return static_cast<int>(r);
     volatile_copy(addr, data, len);
@@ -273,41 +244,41 @@ int MemoryWriter::write_mprotect(std::uintptr_t addr, const std::uint8_t* data, 
 }
 
 int MemoryWriter::write_code(std::uintptr_t addr, const std::uint8_t* data, std::size_t len, int prot) noexcept {
-    if (injected_fault()) return -EIO;
+    if (take_write_fault()) return -EIO;
     int rc = -EINVAL;
     switch (method_) {
         case WriteMethod::ProcMem:
-            rc = write_procmem(addr, data, len);
+            rc = write_direct(addr, data, len);
             break;
         case WriteMethod::Auto:
-            rc = write_procmem(addr, data, len);
-            if (rc != 0) rc = write_mprotect(addr, data, len, prot, false);
+            rc = write_direct(addr, data, len);
+            if (rc != 0) rc = write_reprotect(addr, data, len, prot, false);
             break;
         case WriteMethod::MprotectRW:
-            rc = write_mprotect(addr, data, len, prot, false);
+            rc = write_reprotect(addr, data, len, prot, false);
             break;
         case WriteMethod::MprotectRWX:
-            rc = write_mprotect(addr, data, len, prot, true);
+            rc = write_reprotect(addr, data, len, prot, true);
             break;
     }
     if (rc != 0) return rc;
-    if ((prot & PROT_READ) && !volatile_equal(addr, data, len)) return -EIO;
+    if ((prot & kProtRead) && !volatile_equal(addr, data, len)) return -EIO;
     __builtin___clear_cache(reinterpret_cast<char*>(addr), reinterpret_cast<char*>(addr + len));
     cpu_serialize();
     return 0;
 }
 
 int MemoryWriter::write_pointer(std::uintptr_t* slot, std::uintptr_t value, int prot) noexcept {
-    if (injected_fault()) return -EIO;
+    if (take_write_fault()) return -EIO;
     const std::uintptr_t a = reinterpret_cast<std::uintptr_t>(slot);
     if (a % alignof(std::uintptr_t) != 0) return -EINVAL;
-    if (prot & PROT_WRITE) {
+    if (prot & kProtWrite) {
         __atomic_store_n(slot, value, __ATOMIC_SEQ_CST);
         return 0;
     }
-    if (prot & PROT_EXEC) return -EPERM;  // never make an executable page writable
+    if (prot & kProtExec) return -EPERM;  // never make an executable page writable
     const std::uintptr_t lo = page_floor(a);
-    long r = raw_mprotect(lo, page_size(), prot | PROT_WRITE);
+    long r = raw_mprotect(lo, page_size(), prot | kProtWrite);
     if (r != 0) return static_cast<int>(r);
     __atomic_store_n(slot, value, __ATOMIC_SEQ_CST);
     r = raw_mprotect(lo, page_size(), prot);
@@ -354,7 +325,7 @@ Result map_near(std::uintptr_t lo, std::uintptr_t hi, std::size_t size, NearBloc
     std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.dist < b.dist; });
 
     for (const auto& c : cands) {
-        void* p = ::mmap(reinterpret_cast<void*>(c.addr), size, PROT_READ | PROT_WRITE,
+        void* p = ::mmap(reinterpret_cast<void*>(c.addr), size, kProtRead | kProtWrite,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
         if (p == MAP_FAILED) continue;
         const std::uintptr_t got = reinterpret_cast<std::uintptr_t>(p);
@@ -369,7 +340,7 @@ Result map_near(std::uintptr_t lo, std::uintptr_t hi, std::size_t size, NearBloc
 }
 
 Result protect_exec(const NearBlock& b) {
-    if (::mprotect(reinterpret_cast<void*>(b.base), b.size, PROT_READ | PROT_EXEC) != 0)
+    if (::mprotect(reinterpret_cast<void*>(b.base), b.size, kProtRead | kProtExec) != 0)
         return {Status::ProtectFailed, std::string("mprotect(RX) failed: ") + std::strerror(errno)};
     return Result::ok();
 }
@@ -394,7 +365,7 @@ std::vector<Module> list_modules() {
                 const ElfW(Phdr)& ph = info->dlpi_phdr[i];
                 if (ph.p_type == PT_LOAD) {
                     m.segments.push_back({info->dlpi_addr + ph.p_vaddr, info->dlpi_addr + ph.p_vaddr + ph.p_memsz,
-                                          static_cast<int>(ph.p_flags)});
+                                          (ph.p_flags & PF_X) != 0});
                 } else if (ph.p_type == PT_DYNAMIC) {
                     m.dynamic = info->dlpi_addr + ph.p_vaddr;
                 }
@@ -411,7 +382,7 @@ Result module_exec_ranges(std::uintptr_t addr, std::vector<std::pair<std::uintpt
     for (const auto& m : list_modules()) {
         if (!m.contains(addr)) continue;
         for (const auto& s : m.segments)
-            if (s.flags & PF_X) out.emplace_back(page_floor(s.lo), page_ceil(s.hi));
+            if (s.exec) out.emplace_back(page_floor(s.lo), page_ceil(s.hi));
         return Result::ok();
     }
     return {Status::NotFound, "address is not inside a loaded module"};
@@ -434,7 +405,7 @@ public:
             return false;
         }
         size_ = static_cast<std::size_t>(st.st_size);
-        void* p = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+        void* p = ::mmap(nullptr, size_, kProtRead, MAP_PRIVATE, fd, 0);
         ::close(fd);
         if (p == MAP_FAILED) return false;
         base_ = p;
@@ -535,6 +506,96 @@ Result find_function_by_name(const std::string& name, const std::string& module_
         }
     }
     return {Status::NotFound, "function '" + name + "' not found"};
+}
+
+
+// ---------------------------------------------------------------- GOT slots
+
+namespace {
+
+// True if `value` (the content of the JUMP_SLOT with index `rel_index` in
+// DT_JMPREL) still points at the lazy-binding PLT stub, i.e. the symbol is not
+// bound yet. The stub is `[endbr64] push <rel_index>; jmp ...`, both in the
+// classic .plt and in the IBT-enabled .plt used together with .plt.sec.
+bool is_lazy_plt_stub(const Module& m, std::uintptr_t value, std::size_t rel_index) {
+    if (!m.contains(value)) return false;
+    std::uint8_t code[16] = {};
+    if (safe_read(value, code, sizeof code) < 9) return false;
+    std::size_t p = 0;
+    if (code[0] == 0xF3 && code[1] == 0x0F && code[2] == 0x1E && code[3] == 0xFA) p = 4;
+    if (code[p] != 0x68) return false;
+    std::uint32_t imm;
+    std::memcpy(&imm, code + p + 1, sizeof imm);
+    return imm == rel_index;
+}
+
+std::uintptr_t dyn_ptr(const Module& m, std::uintptr_t v) {
+    // glibc relocates d_ptr entries in place; other loaders may not.
+    return (m.bias != 0 && v < m.bias) ? v + m.bias : v;
+}
+
+}  // namespace
+
+Result find_import_slots(const std::string& symbol, const std::string& module_filter, std::vector<ImportSlot>& out) {
+    out.clear();
+    const auto self_addr = reinterpret_cast<std::uintptr_t>(&raw_syscall);
+    const auto real = reinterpret_cast<std::uintptr_t>(::dlsym(RTLD_DEFAULT, symbol.c_str()));
+    for (const auto& m : list_modules()) {
+        if (m.dynamic == 0 || m.contains(self_addr)) continue;
+        if (m.name.find("linux-vdso") != std::string::npos) continue;
+        if (!module_filter.empty() && m.file_path().find(module_filter) == std::string::npos) continue;
+
+        std::uintptr_t symtab = 0, strtab = 0, strsz = 0, jmprel = 0, pltrelsz = 0, rela = 0, relasz = 0;
+        std::uintptr_t pltrel = DT_RELA, syment = sizeof(ElfW(Sym)), relaent = sizeof(ElfW(Rela));
+        for (const auto* d = reinterpret_cast<const ElfW(Dyn)*>(m.dynamic); d->d_tag != DT_NULL; ++d) {
+            switch (d->d_tag) {
+                case DT_SYMTAB: symtab = dyn_ptr(m, d->d_un.d_ptr); break;
+                case DT_STRTAB: strtab = dyn_ptr(m, d->d_un.d_ptr); break;
+                case DT_STRSZ: strsz = d->d_un.d_val; break;
+                case DT_JMPREL: jmprel = dyn_ptr(m, d->d_un.d_ptr); break;
+                case DT_PLTRELSZ: pltrelsz = d->d_un.d_val; break;
+                case DT_PLTREL: pltrel = d->d_un.d_val; break;
+                case DT_RELA: rela = dyn_ptr(m, d->d_un.d_ptr); break;
+                case DT_RELASZ: relasz = d->d_un.d_val; break;
+                case DT_RELAENT: relaent = d->d_un.d_val; break;
+                case DT_SYMENT: syment = d->d_un.d_val; break;
+                default: break;
+            }
+        }
+        if (symtab == 0 || strtab == 0 || syment != sizeof(ElfW(Sym)) || relaent != sizeof(ElfW(Rela))) continue;
+        if (pltrel != DT_RELA) continue;  // x86-64 uses RELA
+
+        auto scan = [&](std::uintptr_t table, std::uintptr_t size, bool lazy_table) {
+            if (table == 0 || size == 0) return;
+            const auto* r = reinterpret_cast<const ElfW(Rela)*>(table);
+            const std::size_t n = size / sizeof(ElfW(Rela));
+            for (std::size_t i = 0; i < n; ++i) {
+                const auto type = ELF64_R_TYPE(r[i].r_info);
+                if (type != R_X86_64_JUMP_SLOT && type != R_X86_64_GLOB_DAT) continue;
+                const auto symi = ELF64_R_SYM(r[i].r_info);
+                if (symi == 0) continue;
+                const auto* sym = reinterpret_cast<const ElfW(Sym)*>(symtab) + symi;
+                if (sym->st_name >= strsz) continue;
+                const char* nm = reinterpret_cast<const char*>(strtab) + sym->st_name;
+                if (symbol != nm) continue;
+                const std::uintptr_t slot_addr = m.bias + r[i].r_offset;
+                if (!m.contains(slot_addr) || slot_addr % sizeof(std::uintptr_t) != 0) continue;
+                ImportSlot s;
+                s.slot = reinterpret_cast<std::uintptr_t*>(slot_addr);
+                s.current = __atomic_load_n(s.slot, __ATOMIC_SEQ_CST);
+                s.lazy = lazy_table && type == R_X86_64_JUMP_SLOT && is_lazy_plt_stub(m, s.current, i);
+                s.resolved = s.lazy ? real : s.current;
+                s.module = m.file_path();
+                out.push_back(std::move(s));
+            }
+        };
+        scan(jmprel, pltrelsz, true);
+        scan(rela, relasz, false);
+    }
+    if (out.empty()) return {Status::NotFound, "no GOT entry for '" + symbol + "' in the selected modules"};
+    for (const auto& s : out)
+        if (s.lazy && s.resolved == 0) return {Status::NotFound, "cannot resolve '" + symbol + "'"};
+    return Result::ok();
 }
 
 }  // namespace vajra::sys

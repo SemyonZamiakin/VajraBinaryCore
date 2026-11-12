@@ -3,11 +3,6 @@
 // SPDX-License-Identifier: MIT
 #include "vajra/patch.hpp"
 
-#include <dlfcn.h>
-#include <elf.h>
-#include <link.h>
-#include <sys/mman.h>
-
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
@@ -64,7 +59,7 @@ struct MigOp {
     std::shared_ptr<MigrationPlan> inverse;
 };
 
-bool volatile_equal(std::uintptr_t a, const std::uint8_t* b, std::size_t n) {
+VAJRA_NO_TSAN bool volatile_equal(std::uintptr_t a, const std::uint8_t* b, std::size_t n) {
     const volatile std::uint8_t* p = reinterpret_cast<const volatile std::uint8_t*>(a);
     for (std::size_t i = 0; i < n; ++i)
         if (p[i] != b[i]) return false;
@@ -174,7 +169,7 @@ Result execute(const PatchOptions& opts, std::vector<CodeOp>& code, std::vector<
 
     enum class Outcome { Done, Busy, Mismatch, WriteFailed, RollbackFailed };
     Outcome outcome = Outcome::Busy;
-    pid_t busy_tid = 0;
+    sys::tid_t busy_tid = 0;
     std::uintptr_t busy_pc = 0;
     std::size_t bad_index = 0;
     bool bad_is_got = false;
@@ -199,7 +194,7 @@ Result execute(const PatchOptions& opts, std::vector<CodeOp>& code, std::vector<
         }
         if (busy) {
             detail::world_resume();
-            if (attempt + 1 < attempts) sys::raw_sleep_us(opts.busy_retry_delay_us);
+            if (attempt + 1 < attempts) sys::sleep_us(opts.busy_retry_delay_us);
             continue;
         }
 
@@ -287,7 +282,7 @@ Result execute(const PatchOptions& opts, std::vector<CodeOp>& code, std::vector<
     // A thread that was inside the lazy-binding resolver may have written the
     // resolved address over a fresh GOT redirect. Re-apply it in that case.
     for (const GotOp& op : got) {
-        if (!(op.prot & PROT_WRITE)) continue;  // read-only GOT: no lazy binding possible
+        if (!(op.prot & sys::kProtWrite)) continue;  // read-only GOT: no lazy binding possible
         std::uintptr_t cur = __atomic_load_n(op.slot, __ATOMIC_SEQ_CST);
         if (cur != op.replacement && (cur == op.allowed_a || cur == op.allowed_b))
             __atomic_compare_exchange_n(op.slot, &cur, op.replacement, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
@@ -348,7 +343,7 @@ Result prepare_hook(const HookRequest& req, const PatchOptions& opts, const std:
         if (t >= r.first && t < r.second) return {Status::Unsupported, where + ": cannot hook Vajra's own code"};
     int prot = 0;
     if (Result r = sys::range_protection(maps, t, kHookBytes, &prot); !r) return {r.status(), where + ": " + r.message()};
-    if (!(prot & PROT_EXEC)) return {Status::InvalidArgument, where + ": target is not in executable memory"};
+    if (!(prot & sys::kProtExec)) return {Status::InvalidArgument, where + ": target is not in executable memory"};
 
     sys::FunctionInfo fi;
     std::size_t fsize = 0;
@@ -427,7 +422,7 @@ Result prepare_hook(const HookRequest& req, const PatchOptions& opts, const std:
     return Result::ok();
 }
 
-// ------------------------------------------------------------ GOT preparation
+// ------------------------------------------------------------ import (GOT/IAT) preparation
 
 struct ImportRequest {
     std::string symbol;
@@ -436,103 +431,35 @@ struct ImportRequest {
     std::string module_filter;
 };
 
-// True if `value` (the content of the JUMP_SLOT with index `rel_index` in
-// DT_JMPREL) still points at the lazy-binding PLT stub, i.e. the symbol is not
-// resolved yet. The stub is `[endbr64] push <rel_index>; jmp ...`, both in the
-// classic .plt and in the IBT-enabled .plt used with .plt.sec.
-bool is_lazy_plt_stub(const sys::Module& m, std::uintptr_t value, std::size_t rel_index) {
-    if (!m.contains(value)) return false;
-    std::uint8_t code[16] = {};
-    if (sys::safe_read(value, code, sizeof code) < 9) return false;
-    std::size_t p = 0;
-    if (code[0] == 0xF3 && code[1] == 0x0F && code[2] == 0x1E && code[3] == 0xFA) p = 4;
-    if (code[p] != 0x68) return false;
-    std::uint32_t imm;
-    std::memcpy(&imm, code + p + 1, sizeof imm);
-    return imm == rel_index;
-}
-
-std::uintptr_t dyn_ptr(const sys::Module& m, std::uintptr_t v) {
-    // glibc relocates d_ptr entries in place; other loaders may not.
-    return (m.bias != 0 && v < m.bias) ? v + m.bias : v;
-}
-
 Result prepare_import(const ImportRequest& req, const std::vector<sys::MapEntry>& maps, std::vector<GotOp>& out,
                       std::uintptr_t& original) {
     if (req.symbol.empty() || req.replacement == nullptr)
         return {Status::InvalidArgument, "import redirect needs a symbol and a replacement"};
-    const auto self_addr = reinterpret_cast<std::uintptr_t>(&sys::raw_syscall);
     const auto repl = reinterpret_cast<std::uintptr_t>(req.replacement);
-    void* real = ::dlsym(RTLD_DEFAULT, req.symbol.c_str());
     original = 0;
-
-    for (const auto& m : sys::list_modules()) {
-        if (m.dynamic == 0 || m.contains(self_addr)) continue;
-        if (m.name.find("linux-vdso") != std::string::npos) continue;
-        if (!req.module_filter.empty() && m.file_path().find(req.module_filter) == std::string::npos) continue;
-
-        std::uintptr_t symtab = 0, strtab = 0, strsz = 0, jmprel = 0, pltrelsz = 0, rela = 0, relasz = 0;
-        std::uintptr_t pltrel = DT_RELA, syment = sizeof(ElfW(Sym)), relaent = sizeof(ElfW(Rela));
-        for (const auto* d = reinterpret_cast<const ElfW(Dyn)*>(m.dynamic); d->d_tag != DT_NULL; ++d) {
-            switch (d->d_tag) {
-                case DT_SYMTAB: symtab = dyn_ptr(m, d->d_un.d_ptr); break;
-                case DT_STRTAB: strtab = dyn_ptr(m, d->d_un.d_ptr); break;
-                case DT_STRSZ: strsz = d->d_un.d_val; break;
-                case DT_JMPREL: jmprel = dyn_ptr(m, d->d_un.d_ptr); break;
-                case DT_PLTRELSZ: pltrelsz = d->d_un.d_val; break;
-                case DT_PLTREL: pltrel = d->d_un.d_val; break;
-                case DT_RELA: rela = dyn_ptr(m, d->d_un.d_ptr); break;
-                case DT_RELASZ: relasz = d->d_un.d_val; break;
-                case DT_RELAENT: relaent = d->d_un.d_val; break;
-                case DT_SYMENT: syment = d->d_un.d_val; break;
-                default: break;
-            }
+    std::vector<sys::ImportSlot> slots;
+    if (Result r = sys::find_import_slots(req.symbol, req.module_filter, slots); !r) return r;
+    std::uintptr_t lazy_target = 0;
+    for (const sys::ImportSlot& s : slots) {
+        if (s.current == repl) return {Status::AlreadyApplied, req.symbol + " is already redirected in " + s.module};
+        GotOp op;
+        op.slot = s.slot;
+        op.replacement = repl;
+        op.allowed_a = s.current;
+        op.allowed_b = s.resolved;  // a lazy slot may get bound between now and the commit
+        if (s.lazy) {
+            if (lazy_target == 0) lazy_target = s.resolved;
+        } else if (original == 0) {
+            original = s.current;
         }
-        if (symtab == 0 || strtab == 0 || syment != sizeof(ElfW(Sym)) || relaent != sizeof(ElfW(Rela))) continue;
-        if (pltrel != DT_RELA) continue;  // x86-64 uses RELA
-
-        auto scan = [&](std::uintptr_t table, std::uintptr_t size, bool lazy_table) -> Result {
-            if (table == 0 || size == 0) return Result::ok();
-            const auto* r = reinterpret_cast<const ElfW(Rela)*>(table);
-            const std::size_t n = size / sizeof(ElfW(Rela));
-            for (std::size_t i = 0; i < n; ++i) {
-                const auto type = ELF64_R_TYPE(r[i].r_info);
-                if (type != R_X86_64_JUMP_SLOT && type != R_X86_64_GLOB_DAT) continue;
-                const auto symi = ELF64_R_SYM(r[i].r_info);
-                if (symi == 0) continue;
-                const auto* sym = reinterpret_cast<const ElfW(Sym)*>(symtab) + symi;
-                if (sym->st_name >= strsz) continue;
-                const char* nm = reinterpret_cast<const char*>(strtab) + sym->st_name;
-                if (req.symbol != nm) continue;
-                const std::uintptr_t slot_addr = m.bias + r[i].r_offset;
-                if (!m.contains(slot_addr) || slot_addr % sizeof(std::uintptr_t) != 0) continue;
-                auto* slot = reinterpret_cast<std::uintptr_t*>(slot_addr);
-                const std::uintptr_t cur = __atomic_load_n(slot, __ATOMIC_SEQ_CST);
-                if (cur == repl) return {Status::AlreadyApplied, req.symbol + " is already redirected in " + m.file_path()};
-                GotOp op;
-                op.slot = slot;
-                op.replacement = repl;
-                op.allowed_a = cur;
-                if (lazy_table && type == R_X86_64_JUMP_SLOT && is_lazy_plt_stub(m, cur, i)) {
-                    // Unresolved: the first call would go to the dynamic linker.
-                    op.allowed_b = reinterpret_cast<std::uintptr_t>(real);
-                } else {
-                    op.allowed_b = cur;
-                    if (original == 0) original = cur;
-                }
-                int prot = 0;
-                if (Result pr = sys::range_protection(maps, slot_addr, sizeof(std::uintptr_t), &prot); !pr) return pr;
-                op.prot = prot;
-                op.what = "GOT entry for " + req.symbol + " in " + m.file_path() + " (" + hex(slot_addr) + ")";
-                out.push_back(std::move(op));
-            }
-            return Result::ok();
-        };
-        if (Result r = scan(jmprel, pltrelsz, true); !r) return r;
-        if (Result r = scan(rela, relasz, false); !r) return r;
+        int prot = 0;
+        const auto slot_addr = reinterpret_cast<std::uintptr_t>(s.slot);
+        if (Result pr = sys::range_protection(maps, slot_addr, sizeof(std::uintptr_t), &prot); !pr) return pr;
+        op.prot = prot;
+        op.what = "import slot for " + req.symbol + " in " + s.module + " (" + hex(slot_addr) + ")";
+        out.push_back(std::move(op));
     }
-    if (out.empty()) return {Status::NotFound, "no GOT entry for '" + req.symbol + "' in the selected modules"};
-    if (original == 0) original = reinterpret_cast<std::uintptr_t>(real);
+    if (original == 0) original = lazy_target;
     if (original == 0) return {Status::NotFound, "cannot resolve the original address of '" + req.symbol + "'"};
     return Result::ok();
 }
@@ -609,6 +536,12 @@ Result set_stop_signal(int sig) {
 }
 
 int stop_signal() noexcept { return detail::stop_signal_impl(); }
+
+void* find_function(const std::string& name, const std::string& module) {
+    sys::FunctionInfo fi;
+    if (!sys::find_function_by_name(name, module, fi)) return nullptr;
+    return reinterpret_cast<void*>(fi.start);
+}
 
 // ------------------------------------------------------------ Transaction
 
@@ -698,7 +631,7 @@ Result Transaction::commit(Patch* out) {
     std::vector<sys::MapEntry> maps;
     if (Result r = sys::read_maps(maps); !r) return r;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> own_code;
-    if (Result r = sys::module_exec_ranges(reinterpret_cast<std::uintptr_t>(&sys::raw_syscall), own_code); !r)
+    if (Result r = sys::module_exec_ranges(reinterpret_cast<std::uintptr_t>(&sys::page_size), own_code); !r)
         return r;
 
     sys::MemoryWriter writer;

@@ -1,12 +1,11 @@
 // Inline hooks on real functions: compiled C++ targets, hand-written asm
 // prologues, a libc function, chaining, refusals and all write methods.
 // SPDX-License-Identifier: MIT
-#include <dlfcn.h>
-
 #include <cstring>
 
 #include "asm_targets.hpp"
 #include "check.hpp"
+#include "platform.hpp"
 #include "vajra/vajra.hpp"
 
 using namespace vajra;
@@ -160,13 +159,19 @@ TEST(hook_by_name) {
 }
 
 TEST(hook_libc_function) {
-    auto* labs_ptr = reinterpret_cast<long (*)(long)>(::dlsym(RTLD_DEFAULT, "labs"));
+    auto* labs_ptr = reinterpret_cast<long (*)(long)>(testplat::crt_function("labs"));
     CHECK(labs_ptr != nullptr);
     if (!labs_ptr) return;
+    PatchOptions o;
+#if defined(_WIN32)
+    // msvcrt's labs is a leaf function without an unwind (.pdata) entry, so its
+    // bounds are unknown and the body scan has to be skipped explicitly.
+    o.allow_unknown_bounds = true;
+#endif
     Patch p;
-    CHECK_OK(Transaction().hook(labs_ptr, &detour_labs, &orig_labs).commit(&p));
+    CHECK_OK(Transaction(o).hook(labs_ptr, &detour_labs, &orig_labs).commit(&p));
     CHECK_EQ(labs_ptr(-5), 50);
-    CHECK_OK(p.revert());
+    CHECK_OK(p.revert(o));
     CHECK_EQ(labs_ptr(-5), 5);
 }
 
