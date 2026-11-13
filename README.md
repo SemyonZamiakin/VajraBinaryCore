@@ -5,9 +5,48 @@
   <img src="https://img.shields.io/badge/C%2B%2B17-2DD4BF?labelColor=0F2933" alt="C++17">
   <img src="https://img.shields.io/badge/Linux%20%7C%20Windows-x86--64-2DD4BF?labelColor=0F2933" alt="Linux | Windows, x86-64">
   <img src="https://img.shields.io/badge/license-MIT-2DD4BF?labelColor=0F2933" alt="MIT">
+  <img src="https://img.shields.io/badge/dependencies-none-2DD4BF?labelColor=0F2933" alt="No dependencies">
 </p>
 
-# Vajra Binary Core
+<h3 align="center">Change the code <i>and</i> the shape of the data of a running C++ program.<br>No restart. One atomic step. Fully reversible.</h3>
+
+<p align="center">
+  <a href="#demo">Demo</a> ·
+  <a href="#what-a-patch-looks-like">Example</a> ·
+  <a href="docs/DESIGN.md">Design</a> ·
+  <a href="#status-what-is-tested-and-what-is-not">What is tested</a> ·
+  <a href="#building">Build</a>
+</p>
+
+---
+
+Hot-patching a function in a live process is an old trick. The hard part has always been the **data**: the moment the new code expects a struct with a new field, a wider type or a different order, every object already in memory is wrong, and so is every pointer to it. That is usually where live patching ends and the restart begins.
+
+**Vajra does both halves together.** It rewrites machine code while threads keep running, *and* converts every live object of a type to its new layout, fixing up the pointers that refer to them, inside a single transaction that the rest of the program sees as one instantaneous step. If anything fails along the way, nothing has changed. If you change your mind later, it reverts.
+
+| | Inline code hooks | Linux **and** Windows | Stops other threads safely | Migrates live objects to a new struct layout | Code + data in one atomic, revertible transaction |
+|---|:---:|:---:|:---:|:---:|:---:|
+| **Vajra** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| [Microsoft Detours](https://github.com/microsoft/Detours) | ✅ | Windows only | caller lists threads | — | — |
+| [MinHook](https://github.com/TsudaKageyu/minhook) | ✅ | Windows only | ✅ | — | — |
+| [funchook](https://github.com/kubo/funchook) | ✅ | ✅ | — | — | — |
+| Linux kernel livepatch / kpatch | kernel only | Linux kernel | ✅ | adds data via shadow variables, no layout migration | — |
+
+<sub>Comparison based on each project's public documentation at the time of writing; corrections welcome.</sub>
+
+### At a glance
+
+| | |
+|---|---|
+| **Engine** | ~6 000 lines of C++17, zero dependencies: own x86-64 instruction decoder and relocator, ELF and PE parsers, stop-the-world on two operating systems, migration engine, patch agent |
+| **Verified against** | GNU objdump on **2 million+** instructions from real binaries (glibc, libstdc++, ntdll, kernelbase, ...): identical instruction lengths |
+| **Tests** | 75 test cases in 11 suites, stress tests that patch while 8 threads hammer the patched code, fault injection at every write, ASan + UBSan, ThreadSanitizer on the cooperative paths |
+| **Platforms** | x86-64 Linux (GCC, Clang) · x86-64 Windows (MinGW-w64, MINGW64 and UCRT64) |
+| **Safety model** | Refuses what it cannot prove safe: instructions it does not fully understand, branches into the bytes it would overwrite, threads parked inside them, lossy value conversions |
+
+---
+
+## What it is
 
 A live-patching and type-migration engine for native C++ programs on **x86-64 Linux and Windows**. A program that links Vajra can, without restarting:
 
