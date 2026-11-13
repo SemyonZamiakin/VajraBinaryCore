@@ -157,7 +157,7 @@ Measured on an i9-9900K: Linux under WSL2 (Ubuntu, kernel 6.18, GCC 15.2, Clang 
 | `test_agent` | The agent over its real transport through `vajractl`: ping, apply, list, revert, module checks (missing file, unsafe permissions on Linux, not a module), pipe-name squatting on Windows |
 | `demo_live_patch` | The arena demo above, end to end |
 
-Configurations run locally for this release, all passing: Linux GCC `-Werror` RelWithDebInfo, Clang `-Werror` Release, GCC Debug (`-O0`, different prologues), Clang ASan + UBSan; Windows MinGW64 GCC RelWithDebInfo and Debug, UCRT64 GCC. `scripts/check.sh` runs the Linux matrix. The CI workflow is written but has not run on GitHub yet.
+Configurations run locally for this release, all passing: Linux GCC `-Werror` RelWithDebInfo, Clang `-Werror` Release, GCC Debug (`-O0`, different prologues), Clang ASan + UBSan; Windows MinGW64 GCC RelWithDebInfo and Debug, UCRT64 GCC. `scripts/check.sh` runs the Linux matrix. GitHub Actions repeats this on every push: Linux GCC (RelWithDebInfo, Debug), Clang (Release, ASan + UBSan, TSan), Windows MINGW64 and UCRT64, and an install-and-consume check of the CMake package.
 
 **ThreadSanitizer** runs only the parts that do not stop threads by signal (decoder, relocation, migration with cooperative safe points, cooperative stop tests, the append-only migration storm): TSan defers asynchronous signals until a thread enters its runtime, so the signal-based world stop that every code patch needs cannot work under it. The code-patching paths are covered by ASan/UBSan and the stress tests instead.
 
