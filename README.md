@@ -18,11 +18,42 @@
   <a href="#building">Build</a>
 </p>
 
----
+<p align="center"><img src="docs/img/divider.png" width="100%" alt=""></p>
 
-Hot-patching a function in a live process is an old trick. The hard part has always been the **data**: the moment the new code expects a struct with a new field, a wider type or a different order, every object already in memory is wrong, and so is every pointer to it. That is usually where live patching ends and the restart begins.
+## Overview & Use Cases
 
-**Vajra does both halves together.** It rewrites machine code while threads keep running, *and* converts every live object of a type to its new layout, fixing up the pointers that refer to them, inside a single transaction that the rest of the program sees as one instantaneous step. If anything fails along the way, nothing has changed. If you change your mind later, it reverts.
+> **In one sentence:** Vajra lets a running C++ program swap in new machine code for a function *and* convert its live objects to a new struct layout, without a restart, as one atomic step you can undo.
+
+**Why it exists.** Restarting a long-running process throws away its state: connected players, a simulation that has run for hours, warm caches. Hot-patching a function is an old trick, but it breaks the moment the new code expects a struct with a new field, a wider type or a different order: every object already in memory is wrong, and so is every pointer to it. That is usually where live patching ends and the restart begins. **Vajra does both halves together**, inside a single transaction that the rest of the program sees as one instantaneous step. If anything fails along the way, nothing has changed; if you change your mind later, it reverts.
+
+<table>
+  <tr>
+    <td width="33%" valign="top"><b>Hotfix without downtime</b><br><sub>Patch a bug in a game server or a daemon while clients stay connected, and revert if the fix misbehaves.</sub></td>
+    <td width="33%" valign="top"><b>Live development</b><br><sub>Change a function or add a field to a struct in a running game loop or simulation and keep the session's state.</sub></td>
+    <td width="33%" valign="top"><b>Tracing and profiling hooks</b><br><sub>Wrap any function with timing or logging for a while, then remove the hook. The original stays callable through its trampoline.</sub></td>
+  </tr>
+  <tr>
+    <td width="33%" valign="top"><b>Intercept library calls</b><br><sub>Redirect imports (GOT/PLT on Linux, IAT on Windows), for example to inject failures into <code>malloc</code> or file I/O in tests.</sub></td>
+    <td width="33%" valign="top"><b>Evolve in-memory data</b><br><sub>Grow 32-bit counters to 64-bit, reorder or rename fields, with checked conversions instead of silent truncation.</sub></td>
+    <td width="33%" valign="top"><b>Learn binary patching</b><br><sub>A readable decoder, relocator and stop-the-world, with a test around every rule: a practical way into systems programming.</sub></td>
+  </tr>
+</table>
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#0F2933', 'primaryTextColor': '#F8FAFC', 'primaryBorderColor': '#2DD4BF', 'lineColor': '#2DD4BF', 'edgeLabelBackground': '#0F2933', 'textColor': '#2DD4BF', 'fontFamily': 'Segoe UI, Helvetica, Arial, sans-serif'}}}%%
+flowchart LR
+    A["Running program"] --> B{"Stop all threads<br/>at a safe point"}
+    B --> C["Rewrite code<br/>trampolines · GOT/PLT · IAT"]
+    B --> D["Migrate live objects<br/>new layout · pointers fixed"]
+    C --> E{"Every step OK?"}
+    D --> E
+    E -- "yes" --> F["Resume with<br/>new code + new data"]
+    E -- "no" --> G["Roll everything back<br/>resume unchanged"]
+```
+
+**New here?** Watch the [demo](#demo) (a program whose code and data change while it runs), then read [What a patch looks like](#what-a-patch-looks-like). Vajra is version 0.1.0 for x86-64 only; the [status section](#status-what-is-tested-and-what-is-not) lists exactly what is tested.
+
+<p align="center"><img src="docs/img/divider.png" width="100%" alt=""></p>
 
 | | Inline code hooks | Linux **and** Windows | Stops other threads safely | Migrates live objects to a new struct layout | Code + data in one atomic, revertible transaction |
 |---|:---:|:---:|:---:|:---:|:---:|
